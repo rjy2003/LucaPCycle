@@ -1,54 +1,54 @@
-# 阶段 1: 选择一个完美的基础环境
-# 我们选择 NVIDIA 官方的 CUDA 11.7.1 开发镜像，它与 torch==1.13.1 官方支持的 CUDA 版本完全匹配。
-# "devel" 版本包含了完整的编译工具链，这对安装某些库至关重要。
-FROM nvidia/cuda:11.7.1-devel-ubuntu22.04
+# 1. 基础镜像选择 (保持不变，这个选择非常适合)
+# nvidia/cuda:11.8.0-cudnn8-devel-ubuntu22.04 包含了完整的CUDA编译工具链，对DeepSpeed和ESMFold至关重要
+FROM nvidia/cuda:11.8.0-cudnn8-devel-ubuntu22.04
 
-# 阶段 2: 准备系统工具和环境变量
-# 设置为非交互模式，避免 apt-get 在构建时卡住提问。
+# 设置工作目录
+WORKDIR /app
+
+# 设置环境变量，避免交互式提示
 ENV DEBIAN_FRONTEND=noninteractive
 
-# 更新系统并安装核心工具：
-# - wget: 用于下载文件
-# - git: 用于版本控制
-# - build-essential: 极其重要！它包含了 C/C++ 编译器 (g++)，是安装 deepspeed, fair-esm 等库的必需品。
+# 2. 安装基础依赖 (保持不变)
 RUN apt-get update && apt-get install -y \
     wget \
     git \
-    build-essential \
     && rm -rf /var/lib/apt/lists/*
 
-# 阶段 3: 安装 Miniconda 环境管理器
-# Conda 是处理复杂科学计算包 (尤其是 RDKit) 的最佳选择。
-RUN wget https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh -O ~/miniconda.sh && \
-    /bin/bash ~/miniconda.sh -b -p /opt/conda && \
-    rm ~/miniconda.sh
+# 3. 安装 Anaconda (保持不变)
+RUN wget https://repo.anaconda.com/archive/Anaconda3-2022.05-Linux-x86_64.sh -O anaconda.sh && \
+    sh anaconda.sh -b -p /opt/conda && \
+    rm anaconda.sh
 ENV PATH /opt/conda/bin:$PATH
 
-# 阶段 4: 创建一个独立、干净的项目环境
-# 我们为项目创建一个名为 "lucapcycle" 的 conda 环境，并指定 Python 版本以保证一致性。
-RUN conda create -n lucapcycle python=3.9.13 -y
+# 4. 创建Conda环境并安装核心依赖 (*** 这是关键的修改 ***)
+# 我们在创建环境的同时，使用conda安装最复杂的包：rdkit, pytorch, torchvision, torchaudio
+# -c pytorch -c conda-forge 指定了从哪里寻找这些包
+RUN conda create -n lucapcycle python=3.9.13 -y && \
+    conda install -n lucapcycle -c pytorch -c conda-forge -c rdkit \
+    'pytorch=1.13.1' \
+    'torchvision=0.14.1' \
+    'torchaudio=0.13.1' \
+    'pytorch-cuda=11.7' \
+    'rdkit=2023.9.4' \
+    -y && \
+    conda clean -afy
+# 注意: PyTorch 1.13.1 官方是为 CUDA 11.7 构建的，它在 CUDA 11.8 环境下可以向前兼容运行。这里明确指定版本以保证稳定性。
 
-# 阶段 5: 【核心】采用“贵宾通道”策略安装所有 Python 依赖
-# 这是整个 Dockerfile 最关键的一步。我们分三步走，确保最棘手的库被正确安装。
-WORKDIR /app
+# 5. 安装剩余的Python依赖 (*** 这是另一个关键修改 ***)
+# 先将 requirements.txt 复制到镜像中
 COPY requirements.txt .
 
-RUN conda run -n lucapcycle /bin/bash -c " \
-    echo '===> 步骤 1/3: 使用 Conda 安装最难处理的 RDKit...' && \
-    conda install -c conda-forge rdkit==2023.9.4 -y && \
-    \
-    echo '===> 步骤 2/3: 使用 Pip 特殊命令安装 GPU 版本的 PyTorch...' && \
-    pip install torch==1.13.1+cu117 torchvision==0.14.1+cu117 torchaudio==0.13.1 --extra-index-url https://download.pytorch.org/whl/cu117 && \
-    \
-    echo '===> 步骤 3/3: 使用 Pip 和国内镜像源安装所有剩余的依赖...' && \
-    pip install -r requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple \
+# 使用pip安装requirements.txt中剩余的包
+# 我们先过滤掉已经用conda安装的包，避免冲突
+# 然后再执行pip install
+RUN echo "conda activate lucapcycle" > ~/.bashrc && \
+    conda run -n lucapcycle /bin/bash -c " \
+    grep -v -E 'torch|rdkit' requirements.txt > requirements_pip.txt && \
+    pip install -r requirements_pip.txt -i https://pypi.tuna.tsinghua.edu.cn/simple \
     "
 
-# 阶段 6: 将你的项目代码复制到镜像中
-# 这一步会把你本地的所有代码文件（.py, .sh 等）都拷贝进去。
+# 6. 将所有代码复制到镜像中
 COPY . .
 
-# 阶段 7: 定义容器启动后的默认行为
-# 当容器启动时，它会自动进入 "lucapcycle" 这个 conda 环境，并打开一个 bash 终端。
-# 这让你一进入容器，就处于一个完美的、随时可以运行 python 命令的状态。
-CMD ["conda", "run", "-n", "lucapcycle", "bash"]
+# 7. 设置容器启动后的默认命令
+CMD ["/bin/bash", "-c", "echo 'Container is running. Activate environment with: conda activate lucapcycle' && /bin/bash"]
